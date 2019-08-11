@@ -1,16 +1,7 @@
 
 import pandas as pd
 import numpy as np
-import vcf
-
-import warnings
-import os
-import sys
-
-from .utility import (infile_handler,
-                     outfile_handler,
-                     is_gzip)
-
+from .utility import infile_handler
 
 
 #################################
@@ -19,9 +10,8 @@ from .utility import (infile_handler,
 class Dataset(object):
     def __init__(self, sample_ids):
         self.sample_ids = list(sample_ids)
-        self.data = {sample_id : Sample(sample_id) for sample_id in sample_ids}
+        self.data = {sample_id: Sample(sample_id) for sample_id in sample_ids}
         self.dbsnp_vcf = None
-
 
     def add_vcf(self, sample_id, vcfname, vcfpath):
         self.data[sample_id].add_vcf(vcfname, vcfpath)
@@ -31,12 +21,6 @@ class Dataset(object):
         for sample_id in self.sample_ids:
             self.data[sample_id].get_pass_variants()
         return
-
-    def get_consensus_union(self):
-        for sample_id in self.sample_ids:
-            pass
-        pass
-
 
     def __str__(self):
         string = "Sample IDs : %s " % ', '.join(self.sample_ids)
@@ -59,6 +43,10 @@ class Sample(object):
         self.metadata = metadata
         self.vcfs = {}
         self.pass_vcfs = {}
+        self.df_consensus = None
+        self.df_sanger_VAF = None
+        self.df_consensus_nondbSNP = None
+        self.df_consensus_nondbSNP_VAF = None
 
     def process_sample(self):
         self.get_pass_variants()
@@ -71,11 +59,12 @@ class Sample(object):
         return self.vcfs[vcfname]
 
     def get_pass_variants(self):
-        filter_has_pass = lambda df : df.loc[map(lambda f: "PASS" in f,
-                                                 df["FILTER"])]
+        def filter_has_pass(df):
+            select = ["PASS" in filter_tag for filter_tag in df["FILTER"]]
+            return df.loc[select]
         for vcfname in self.vcfs:
             self.pass_vcfs[vcfname] = filter_has_pass(self.vcfs[vcfname].df)
-        return
+        return self.pass_vcfs
 
     def get_vcf(self, vcfname):
         return self.vcfs[vcfname]
@@ -87,13 +76,11 @@ class Sample(object):
         pass_vcfnames = sorted(self.pass_vcfs.keys())
         fst_name = pass_vcfnames[0]
         df_result = self.pass_vcfs[fst_name].loc[:, ["ALT"]]
-        df_result.columns = ["ALT_%s" % fst_name]
         for name in pass_vcfnames[1:]:
             df2 = self.pass_vcfs[name].loc[:, ["ALT"]]
-            df2.columns = ["ALT_%s" % name]
             df_result = pd.merge(df_result, df2,
                                  how="inner",
-                                 on=["CHROM", "POS", "REF"])
+                                 on=["CHROM", "POS", "REF", "ALT"])
         self.df_consensus = df_result
         return df_result
 
@@ -128,36 +115,21 @@ class Sample(object):
         self.pass_vcfs = {}
         return
 
-
     def consensus_nondbSNP(self, dbsnp_snv_variant_dict):
-        vcf_names = self.vcfs.keys()
         def in_dbSNP(row):
-            alts = np.array(row[["ALT_%s" % name for name in vcf_names]])
-            alt = alts[0]
-            if np.all(alts == alt):
-                var = row.name[0] + '_' + str(row.name[1]) + '_' + row.name[2] + '>' + alt
-                if var in dbsnp_snv_variant_dict:
-                    return True
-            else:
-                warnings.warn("WARNING: disagreeing consensus calls: %s\n%s"
-                              %(self.sample_id, str(row)))
-            return False
-        df = self.df_consensus.copy(deep=True)
-        df["in_dbSNP"] = df.apply(in_dbSNP, axis=1)
+            return f"{row.name[0]}_{row.name[1]}_{row.name[2]}>{row['ALT']}" in dbsnp_snv_variant_dict
+        self.df_consensus["in_dbSNP"] = self.df_consensus.apply(in_dbSNP, axis=1)
+        self.consensus_nondbSNP = self.df_consensus.groupby("in_dbSNP").get_group(False).drop("in_dbSNP", axis=1)
+        return self.consensus_nondbSNP
+
+    def consensus_nondbSNP_VAF(self, dbsnp_snv_variant_dict):
+        df = self.consensus_nondbSNP(dbsnp_snv_variant_dict)
         self.df_consensus_nondbSNP_VAF = (
-            pd.merge((df.groupby("in_dbSNP")
-                        .get_group(False)
-                        .drop("in_dbSNP", axis=1)),
+            pd.merge(df,
                      self.df_sanger_VAF,
                      how="inner",
                      on=["CHROM", "POS", "REF"]))
-        return
-
-
-
-
-
-
+        return self.df_consensus_nondbSNP_VAF
 
 
 #################################
@@ -174,12 +146,7 @@ class VCF(object):
         self.vcf_filepath = vcf_filepath
         self.pandas_engine = pandas_engine
         # parse the body of vcf into a Pandas.DataFrame object
-        (self.df,
-         self.header,
-         self.SAMPLES) = VCF.parse_vcf(vcf_filepath,
-         pandas_engine=pandas_engine)
-
-
+        self.df, self.header, self.SAMPLES = VCF.parse_vcf(vcf_filepath, pandas_engine=pandas_engine)
 
     @staticmethod
     def parse_vcf(vcf_filepath, pandas_engine="python"):
@@ -188,10 +155,10 @@ class VCF(object):
             for line in vcf_file:
                 line = line.rstrip()
                 if line.startswith("##"):
-                # if it is a header line
+                    # if it is a header line
                     header.append(line)
                 elif line.startswith("#CHROM"):
-                # if it is the column names line
+                    # if it is the column names line
                     columns = line[1:].split('\t')
                     # immediately break the loop
                     # so that the filehandle starts with the main body
@@ -201,8 +168,8 @@ class VCF(object):
             df = pd.read_csv(vcf_file, sep='\t',
                              header=None,
                              engine=pandas_engine,
-                             dtype={0 : 'category',
-                                    1 : np.uint32})
+                             dtype={0: 'category',
+                                    1: np.uint32})
         # Give correct header
         df.columns = columns
         # slice out samples
@@ -221,8 +188,8 @@ class VCF(object):
         return common
 
     def get_info_tags_intersection(self):
-        get_tags = lambda info : set(field.split('=', maxsplit=1)[0]
-                                     for field in info.split(';'))
+        def get_tags(info):
+            return set(field.split('=', maxsplit=1)[0] for field in info.split(';'))
         common = set(get_tags(self.df["INFO"][0]))
         for info in self.df["INFO"]:
             current = get_tags(info)
@@ -299,32 +266,3 @@ class VCF(object):
             except ValueError:
                 pass
         return result
-
-
-
-
-############# Legacy.....
-
-class Sanger_VCF(VCF):
-    def __init__(self, vcf_filepath, pandas_engine="c"):
-        # Parent class initiation
-        VCF.__init__(self, vcf_filepath, pandas_engine)
-
-        self.vcf_reader = vcf.Reader(filename=vcf_filepath,
-                                     compressed=is_gzip(vcf_filepath))
-        if store_record:
-            self.records = [rec for rec in self.vcf_reader]
-        else:
-            self.records = None
-
-        self.FORMAT = self.vcf_reader.formats
-        self.INFO = self.vcf_reader.infos
-        self.SAMPLES = self.vcf_reader.samples
-
-
-
-
-
-
-
-
