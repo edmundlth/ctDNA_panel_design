@@ -87,17 +87,35 @@ class Sample(object):
     def get_sanger_VAF(self, df_sanger=None, sanger_samplename="TUMOUR"):
         if not df_sanger:
             df_sanger = self.pass_vcfs["SANGER"]
-        df_result = pd.DataFrame(index=df_sanger.index,
-                                 columns=["DP", "VAF", "FVAF", "RVAF"])
-        for index in df_sanger.index:
-            row = df_sanger.loc[index, :]
-            dp = VCF.get_row_info(row)["DP"]
-            alt = row["ALT"]
-            fmt = VCF.get_row_sample_genotype(row, sanger_samplename)
-            fad = fmt['F' + alt + 'Z']
-            rad = fmt['R' + alt + 'Z']
+        result = []
+        for row in df_sanger.itertuples():
+            # index = row[0]
+            alt = row[2]
+            if len(alt) != 1:
+                print(row)
+            info_dict = {}
+            for rec in row[5].split(';'):
+                if '=' in rec:
+                    key, val = rec.split('=')
+                    if str.isnumeric(val):
+                        val = float(val)
+                else:
+                    key = rec
+                    val = True
+                info_dict[key] = val
+            # row = df_sanger.loc[index, :]
+            dp = info_dict["DP"]
+            fmt = dict(
+                # TODO: The TUMOUR sample column is column 8.. Need to abstract this.
+                zip(row[6].split(':'), row[8].split(':'))
+            )
+            # fmt = VCF.get_row_sample_genotype(row, sanger_samplename)
+            fad = int(fmt['F' + alt + 'Z'])
+            rad = int(fmt['R' + alt + 'Z'])
             ad = fad + rad
-            df_result.loc[index, ["DP", "VAF", "FVAF", "RVAF"]] = [dp, ad / dp, fad / dp, rad / dp]
+            result.append([dp, ad / dp, fad / dp, rad / dp])
+        df_result = pd.DataFrame(result, index=df_sanger.index,
+                                 columns=["DP", "VAF", "FVAF", "RVAF"])
         self.df_sanger_VAF = df_result
         return df_result
 

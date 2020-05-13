@@ -3,12 +3,11 @@ from bokeh.plotting import figure
 from bokeh.transform import factor_cmap
 from bokeh.palettes import Paired12
 from bokeh.models import BoxAnnotation, Range1d
-# from bokeh.layouts import gridplot
-# from bokeh.io import output_file
 
 import numpy as np
 import intervaltree
 import scipy.cluster.hierarchy as shc
+from scipy.stats import binom_test
 
 CHROMS = [f"{i}" for i in range(1, 23)] + ["X", "Y"]
 # HG19
@@ -61,6 +60,7 @@ def bokeh_rainfall_plot(dataset,
                         kataegis_func=None,
                         gene_interval_tree_by_chrom=None,
                         point_size=3,
+                        title_fontsize=10,
                         plot_width=250,
                         plot_height=250):
     if sample_ids is None:
@@ -70,7 +70,7 @@ def bokeh_rainfall_plot(dataset,
     assert len(sample_alias) == len(sample_ids)
     if chroms is None:
         chroms = CHROMS
-    factors = ['AC', 'CA', 'AG', 'GA', 'AT', 'TA', 'CG', 'GC', 'CT', 'TC', 'GT', 'TG']
+    factors = ['AG', 'TC', 'AC', 'TG', 'AT', 'TA', 'CA', 'GT', 'CT', 'GA', 'CG', 'GC']
     tooltips = [
         ("x", "$x"),
         ("y", "$y"),
@@ -103,21 +103,15 @@ def bokeh_rainfall_plot(dataset,
                              y_axis_type="log",
                              y_range=y_ref_range,
                              x_range=x_ref_range[chrom])
-                # else:
-                #     fig = figure(plot_width=plot_width,
-                #                  plot_height=plot_height,
-                #                  title=title,
-                #                  tooltips=tooltips,
-                #                  y_axis_type="log",
-                #                  y_range=(1, np.max(df_data["dist"])))
-                #     y_ref_fig = fig
                 fig.scatter("POS", "dist",
                             source=df_data,
                             size=point_size,
                             color=factor_cmap('sub', Paired12, factors))
+                fig.title.text_font_size = f"{title_fontsize}pt"
                 kataegis_windows = kataegis_func(df_data["POS"])
                 if kataegis_windows:
                     fig.title.text_color = "red"
+                    fig.title.text += f" k={len(kataegis_windows)}"
                 for start, end in kataegis_windows:
                     fig.add_layout(BoxAnnotation(left=start, right=end, fill_color="red", fill_alpha=0.2))
                     if gene_interval_tree_by_chrom is not None:
@@ -176,6 +170,34 @@ def kataegis_detection_by_num_var_in_window(positions,
     return result
 
 
+def kataegis_detection_by_average_variant_distance2(positions,
+                                                    min_num_var=6,
+                                                    max_avg_dist=1000,
+                                                    is_sorted=False):
+    total_num_var = len(positions)
+    if total_num_var < 2:
+        return []
+    x = np.array(positions)
+    y = np.diff(x)  # len(y) == len(x) - 1
+    if not is_sorted:
+        x.sort()
+    i = 0
+    result = []
+    while i < total_num_var - min_num_var:
+        num_var = min_num_var
+        start = x[i]
+        while np.mean(y[i: i + num_var - 1]) <= max_avg_dist and i + num_var < total_num_var:
+            num_var += 1
+        num_var -= 1
+        if np.mean(y[i: i + num_var - 1]) <= max_avg_dist and num_var >= min_num_var:
+            end = x[i + num_var - 1]
+            result.append((start, end))
+            i += num_var
+        else:
+            i += 1
+    return result
+
+
 def kataegis_detection_by_average_variant_distance(positions,
                                                    min_num_var=6,
                                                    max_avg_dist=1000,
@@ -184,24 +206,20 @@ def kataegis_detection_by_average_variant_distance(positions,
     if total_num_var < 2:
         return []
     x = np.array(positions)
-    y = np.diff(x)  # len(y) = len(x) - 1
+    y = np.diff(x)  # len(y) == len(x) - 1
     if not is_sorted:
         x.sort()
-    i = 0
     result = []
-    while i < total_num_var - min_num_var:
-        num_var = min_num_var
-        avg_dist = np.mean(y[i: i + num_var - 1])
-        if avg_dist <= max_avg_dist:
-            while avg_dist <= max_avg_dist and i + num_var < total_num_var:
-                num_var += 1
-                avg_dist = np.mean(y[i: i + num_var - 1])
-            start = x[i]
-            end = x[i + num_var - 1]
+    largest_end = 0
+    for i in range(total_num_var - min_num_var):
+        start = x[i]
+        end = None
+        for j in range(i + min_num_var - 1, total_num_var):
+            if x[j] > largest_end and np.mean(y[i: j]) <= max_avg_dist:
+                end = x[j]
+                largest_end = end
+        if end is not None:
             result.append((start, end))
-        else:
-            num_var = 1
-        i += num_var
     return result
 
 
@@ -229,13 +247,46 @@ def kataegis_detection_by_hierarchical_clustering(positions,
     if windows:
         start, end = windows[0]
         for current_start, current_end in windows[1:]:
-            if current_start < end:
-                end = current_end  # no interval containment possible
+            if current_start < start:
+                start = current_start
+            elif current_start < end:
+                end = current_end
             else:
                 result.append((start, end))
                 start = current_start
                 end = current_end
     return result
+
+
+def kataegis_detection_by_binomial_p(positions, chrom_length, p=10e-10, is_sorted=False):
+    x = np.array(positions)
+    n = len(x)
+    if n < 2:
+        return []
+    if not is_sorted:
+        x.sort()
+    windows = []
+    # bonferroni correction
+    num_test = (n - 1) * n // 2
+    p = p / num_test
+    p_hypothesis = n / chrom_length
+    i = 0
+    while i < n - 1:
+        start = x[i]
+        end = None
+        num_var = 2
+        while i + num_var - 1 < n:
+            current_end = x[i + num_var - 1]
+            length = int(current_end - start + 1)
+            p_test = binom_test(x=num_var, n=length, p=p_hypothesis, alternative="greater")
+            if p_test < p:
+                end = current_end
+                print((length, num_var, length / num_var, p_test))
+            num_var += 1
+        if end is not None:
+            windows.append((start, end))
+        i += 1
+    return windows
 
 
 def get_clusters_from_linkage_matrix(links, observations):
@@ -270,4 +321,4 @@ def gaussian_smoothing():
 
 def variant_interval_tree(positions):
     x = np.array(positions)
-    return intervaltree.IntervalTree(zip(x, x + 1))
+    return intervaltree.IntervalTree.from_tuples(zip(x, x + 1))
